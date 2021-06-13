@@ -1,0 +1,672 @@
+---
+title: "Final Project Part I - (Generalized) Linear models"
+author: "Alpha"
+date: "11/15/2020"
+output: 
+  bookdown::pdf_book:
+    toc: FALSE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, fig.align = "center")
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(magrittr)
+library(car)
+library(glmnet)
+library(ggpubr)
+library(patchwork)
+library(broom)
+options(scipen = 200)
+```
+
+```{r load-data}
+data <- read.csv("data/happiness_data.csv") # for training
+data_valid <- read.csv("data/happiness_valid.csv") # for test
+Coutry_withRegions <- read.csv("data/CountryInfo.csv") # regions included
+submission_result <- read.csv("data/sample_submission.csv")
+```
+
+
+# Introduction
+
+Happiness is the essence of human pursuit across time and regions. Although the components that determines different countries’ happiness index varies, we believe that there are some common underlying factors that affect people’s happiness index across the world. With the data provided by United Nations, this project aims to provide insight into the factors that affect people’s happiness index in different regions (Part I) as well as predicting happiness index given relevant information (Part II). Combining with each country/region’s factual information, such as `GDP`, `population`, and `Health`, the `happiness dataset` consists variables generated based on questionnaires that do not have assigned units and reflect their relative magnitude only.
+
+Since Part I of the project focuses on interpreting the factors’ impacts on the happiness index, the crux of the model in Part I is about finding influential factors on happiness index rather than striving for the best predictive model. Hence, we will seek a generalized linear model on the `happiness dataset` collected from 2011 to 2018 for better variable interpretation. 
+
+First, we will explore the data in section 2 to get a general idea of the overall relationship among the variables. In section 3, we will conduct a series of modeling-building and feature manipulation/selection to get a final linear model. Without specified or fixed units, the generated variables are scores indicating their values relative to other countries’. This gives us more freedom on data transformation so that we can transform some variables for multinormality while making a flexible balance to their interpretability. We will present the final model to UN in section 4 along with some special findings according to our model. Finally, to evaluate our model, we will apply it on the test dataset to see how well the model fits the data via criteria listed in section 5, which includes bias, maximum deviation, Root Mean Square Error (RMSE), and coverage. 
+
+# Exploratory data analysis
+
+## Data Summaries
+
+```{r EDA-datasum, message=F}
+EDA.datatype <- map_df(data, class) %>% t() %>% set_colnames("Type")
+
+EDA.datasummaries <- map_df(data[,-c(1,2)], 
+                            ~ c(range(.), mean(.), quantile(., c(.25, .75)))) %>% 
+  mutate_at(vars(Population), ~as.character(round(.))) %>% # format output
+  mutate_at(vars(-Population), ~round(., 3)) %>% 
+  t() %>% set_colnames(c("Min", "Max", "Mean", "1stQuantile", "3rdQuantile"))
+
+left_join(as.data.frame(EDA.datatype) %>% rownames_to_column("Variable"), 
+          as.data.frame(EDA.datasummaries) %>% rownames_to_column("Variable")) %>% 
+  dplyr::select(Variable, Type, Min, "1stQuantile", Mean, "3rdQuantile", Max) %>% 
+  kable(digits = 3, align = "lrrrrrr", row.names = T,
+        caption = "Descriptive summaries of the raw data") %>% 
+  kable_styling(latex_options = "hold_position")
+```
+
+The dataset includes happiness data from 2011 to 2018 for worldwide countries. The raw data contains `r ncol(data)` variables and `r nrow(data)` observations. As summarized in the table \@ref(tab:EDA-datasum), all variables except `Country.Territory` are quantitative. Among the quantitative variables, all but `Year` can be viewed as continuous. Besides, clearly the predictors are on different scales; `Population` and `GDP` have much larger orders of magnitude compared to other predictors. It implies that potential transformation may be needed in the following modeling. 
+
+```{r EDA-years}
+data %>% count(Country.Territory) %>% pull(n) %>% table() %>% 
+  as.matrix() %>% t() %>% 
+  as.data.frame() %>% set_rownames("Count of Recorded Years") %>% 
+  kable(caption = "Frequency table for the recorded years of each country") %>% 
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r DeleteMissing}
+data_fullrec <- data %>% count(Country.Territory) %>% filter(n == 8) %>%
+  dplyr::select(-n) %>%
+  inner_join(data, "Country.Territory")
+```
+
+```{r add-region}
+data_fullrec <- inner_join(data_fullrec, Coutry_withRegions, "Country.Territory") %>% 
+  dplyr::select(-Code)
+```
+
+Besides, not all countries have full 8-year records. There are a total of `r length(unique(data$Country.Territory))` countries in the raw data, among which `r length(unique(data$Country.Territory))-115` don't have full records over the 8 years from 2011 to 2018 (as shown in table \@ref(tab:EDA-years)). For simplicity, we only keep the countries that have full 8-year records. After the filtering, there remains 115 countries and a total of `r nrow(data_fullrec)` records with no missing values. 
+
+In addition, the countries in the dataset belong to 10 regions, table \@ref(tab:countRegion) summarizes the number of records within each region.
+
+```{r countRegion}
+data_fullrec %>% count(Region) %>% 
+  kable(caption = "Number of records within each region") %>% 
+  kable_styling(latex_options = "hold_position")
+```
+
+## Visualizations
+
+### Empirical Distributions
+
+```{r EDA-Hist,message=F,fig.align="center",fig.height=6.5,fig.width=8,fig.cap="Histogram of variables"}
+data_fullrec %>% 
+  pivot_longer(Population:Happiness, names_to = "variable") %>% 
+  ggplot() + 
+  geom_histogram(aes(x = value, y = ..density..), color = "white", alpha = .7) +
+  geom_density(aes(x = value), color = "#363636", size = 1) + 
+  facet_wrap(~variable, scale = "free") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.y = element_blank())
+```
+
+First of all, we would like to get an idea of how the variables are distributed, as shown in figure \@ref(fig:EDA-Hist). There are several noticeable patterns:
+
+- Roughly speaking, the continuous response `Happiness` is symmetric and nearly normal, implying that the normal assumption may be basically satisfied (after potential transformation) if we are going to build a Gaussian linear model on it.
+
+- The predictors `GDP` and `Population` have extremely wide ranges and heavy tails on the right, meaning that while most of the countries have a moderate level of population and GDP, there are few countries having extremely large population and GDP. This result is a consistent to the summary statistics in table \@ref(tab:EDA-years), where the maximum values of `GDP` and `Population` are much larger than their correponding 3nd quantiles. Two possible treatments may be desired before these two predictors enter the model: 1) log-transformation, which is helpful for scaling down strictly positive variables with large order of magnitude, and 2) computing the GDP per capita, which is a commonly used approach to handle this kind of economics variables and also has very good interpretability.
+
+- The empirical distributions of other variables are not too bad; they are all roughly unimodel, lying within a moderate range without any clear outlying values.
+
+Also, we look into whether `Happiness` is distributed differently across different countries, regions and years, as shown in figure \@ref(fig:EDA-countryplot) and \@ref(fig:EDA-boxplot). As a result, different countries have different "baseline levels" of `Happiness` and each country's `Happiness` is basically varying around its mean. Besides, `Happiness` also shows clear difference across the 10 different regions. But for years, there is no clear pattern of the response `Happiness` across different years in terms of the mean, although the median seems to have a weakly increasing trend. 
+
+```{r EDA-countryplot,fig.height=3,fig.width=6,fig.cap="Happiness on different years for different countries",cache=T}
+data_fullrec %>% 
+  filter(Country.Territory %in% c("Afghanistan", "Australia", "Iraq", "Japan",
+                                  "Nepal", "New Zealand", "Turkey", "Zimbabwe")) %>% 
+  ggplot() +
+  geom_line(aes(x = Year, y = Happiness)) + 
+  facet_wrap(~Country.Territory, nrow = 2) +
+  theme_bw(base_size = 10)
+```
+
+```{r EDA-boxplot,message=F,fig.height=3,fig.width=8,fig.cap="Happiness for different regions and years (crosses denote the means)",cache=T}
+p1 <- data_fullrec %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = Region, y = Happiness), fill = "#8aabc7") +
+  geom_point(aes(x = Region, y = mean), 
+             data = data_fullrec %>% group_by(Region) %>% summarise(mean = mean(Happiness)),
+             shape = 4, size = 2) +
+  theme_bw(base_size = 10) + coord_flip()
+
+p2 <- data_fullrec %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = as.factor(Year), y = Happiness), fill = "#8aabc7") +
+  geom_point(aes(x = as.factor(Year), y = mean), 
+             data = data_fullrec %>% group_by(Year) %>% summarise(mean = mean(Happiness)),
+             shape = 4, size = 2) +
+  labs(x = "Year") + theme_bw(base_size = 10)
+
+p1 + p2 + plot_layout(widths = c(0.55, 0.45))
+```
+
+
+### Correlation Structure Analysis
+
+In addition to the variables empirical distributions, the correlation structure among the dataset is also of particular interests. Since we have 13 numerical variables here, instead of making all possible pairwise scatterplots, which will be extremely tedious, we plot a correlation map, as shown in figure \@ref(fig:EDA-corrPlot).
+
+```{r EDA-corrPlot,fig.height=4.5,fig.width=4.5,fig.cap="Correlation among variables",cache=T}
+corrplot::corrplot(cor(data_fullrec[,-c(1, 15)]), 
+                   method = "circle", type = "lower", diag = F,
+                   tl.col = "black", tl.cex = 0.7,
+                   addCoef.col = "black", number.cex = 0.4, number.font = 1)
+```
+
+```{r EDA-betweenPredictors,warning=F,fig.width=7,fig.height=3.5,fig.cap="Scatterplots of three groups of predictors",cache=T}
+plot.between_predictors <- function(data.frame, predictor1, predictor2) {
+  data.frame %>% 
+    ggplot() + geom_point(aes(get(predictor1), get(predictor2)), size = 0.7) +
+    labs(x = predictor1, y = predictor2) +
+    theme_bw()
+}
+p1 <- plot.between_predictors(data_fullrec, "Health", "Support")
+p2 <- plot.between_predictors(data_fullrec, "Freedom", "Positive")
+p3 <- data_fullrec %>% 
+  ggplot() + 
+  geom_point(aes(Population, GDP, color = Country.Territory), 
+             size = 0.7, show.legend = F) +
+  theme_bw() + xlim(c(0, 10000000)) + ylim(c(0, 650))
+(p1 | p2) / p3
+```
+
+As for the relationships between the response `Happiness` and its predictors, `Support`, `Health` and `Positive` demonstrate some associations with `Happiness` in terms of the linear correlation coefficient. Among the predictors, there are three pairs of predictors having clearly higher correlations than the other predictors; that is, `Population` vs `GDP`, `Health` vs `Support`, and `Positive` vs `Freedom`. 
+
+We further draw the pairwise scatterplots for these three pairs, as shown in figure \@ref(fig:EDA-betweenPredictors). For the scatterplot of `Population` vs `GDP`, we color each point with its belonging country (i.e., `Country.Territory`) and limit the ranges of the axis to make the plot clear. 
+
+It turns out that: 1) higher population tends to be associated with higher GDP, and 2) different countries are "well separated" according its population and GDP. In other words, different countries have different scale of population and GDP, which can be totally non-comparable. An advisable choice is to replace `Population` and `GDP` with GDP per capita, which scales down the range as well as provides better interpretation.
+
+As for `Health` vs `Support` and `Positive` vs `Freedom`, since their correlations are not as high as, say, 0.8 or 0.9, and we expect more predictors to improve model fit and provide potential interpretation to `Happiness`, so the advantage of their entering the model may outweigh the potential collinearity problem. Therefore, we don't remove any of them in the following models.
+
+
+
+# Methods
+
+## Train/test Splitting
+
+```{r split-data}
+data.train <- data_fullrec %>% filter(Year != 2018)
+data.test <- data_fullrec %>% filter(Year == 2018)
+ytrue.train <- data.train$Happiness
+ytrue.test <- data.test$Happiness
+```
+
+```{r rmse-fcn}
+# Function to calculate the RMSE for testing goodness of fit
+RMSE <- function(y_true, y_pred) { sqrt(mean((y_true - y_pred)^2)) }
+```
+
+Before the modeling, we split out data into a training set which includes the data of each country from 2011 to 2017 and a test set which includes the data of each country in 2018. After the split, there are a total of `r nrow(data.train)` training samples, and `r nrow(data.test)` testing samples. In the following sections, models will be fit on the training set and be tested on the test set, and prediction will be made on both sets to compare the training RMSE versus test RMSE. 
+
+## Initial Modeling
+
+At the very beginning, we build an intial linear regression model, with `Happiness` being the response and all other 13 variables as predictors. Note that in this initial model, `Country.Territory`, which includes 115 countries, creates 114 dummy variables. 
+
+```{r initial-model}
+# linear model 1: initial model
+lm1 <- lm(Happiness ~ . - Region, data = data.train)
+lm1 %>% anova() %>% as.data.frame() %>% 
+  kable(digits = 3, caption = "Anova table for the initial model") %>% 
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r initial-model-stat}
+# make prediction, get rmse and r2
+ypred.lm1.train <- predict(lm1, data.train)
+ypred.lm1.test <- predict(lm1, data.test)
+rmsetable.lm1 <- data.frame(RMSE.train = RMSE(ypred.lm1.train, ytrue.train), 
+                            RMSE.test = RMSE(ypred.lm1.test, ytrue.test))
+r2table.lm1 <- data.frame(R2 = summary(lm1)$r.squared, 
+                          R2adj = summary(lm1)$adj.r.squared)
+cbind(rmsetable.lm1, r2table.lm1) %>% 
+  kable(digits = 3, 
+        caption = "Statistics of the initial model") %>% 
+  kable_styling(latex_options = "hold_position")
+```
+
+Table \@ref(tab:initial-model) is the ANOVA table for this model and table \@ref(tab:initial-model-stat) summarizes the $R^2$ and RMSE statistics. Unsurprisingly, the initial model, with 114 dummy variables for the countries, provides a high $R^2=$ `r round(r2table.lm1[1,1], 3)`, indicating an excellent model fit. However, there are several problems on `Country.Territory` being a predictor:
+
+1. Potential over-fitting problem calls for attention. The test set RMSE is nearly 1.6 times higher than the training set RMSE. In fact, as shown in figure \@ref(fig:EDA-countryplot), different countries have clearly different baseline levels of `Happiness`, and within each country, there are only 8 records from 2011 to 2018. In other words, when `Country.Territory` enters the model as a strongly influential and deciding predictor on the response and splits the data into 115 tiny parts, we may arrive at quite inaccurate results on new data if, for example, a country for some reason has totally different values on other predictors in a year. 
+
+2. Another problem is that when the new data has different `Country.Territory` that doesn't exist in our training set, then we may completely fail to make a fair prediction. In other words, the model is hard to be generalized when meeting with other countries. 
+
+Due to these reasons, `Country.Territory` won't be included in the following models. A natural substitution for `Country.Territory` is `Region`. By including `Region` into the model, we consider the region-specific baseline levels of `Happiness` as well as avoid potential over-fitting as it only includes 10 levels so that within each region there are sufficient amount of representative samples (as shown in table \@ref(tab:countRegion)).
+
+```{r lm2,fig.height=4,fig.width=6,fig.cap="Model diagnosis for the model excluding country but including region"}
+# linear model 2: delete `Country.Territory` and include `Region`
+lm2 <- lm(Happiness ~ . - Country.Territory, data = data.train)
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+plot(lm2, cex = 0.5, las = 0.5, cex.caption = 0.8)
+```
+
+```{r lm2-r2stat}
+r2table.lm2 <- data.frame(R2 = summary(lm2)$r.squared, 
+                          R2adj = summary(lm2)$adj.r.squared)
+```
+
+```{r lm2-rmse}
+ypred.lm2.train <- predict(lm2, data.train)
+ypred.lm2.test <- predict(lm2, data.test)
+rmsetable.lm2 <- data.frame(RMSE.train = RMSE(ypred.lm2.train, ytrue.train), 
+                            RMSE.test = RMSE(ypred.lm2.test, ytrue.test))
+cbind(rmsetable.lm2, r2table.lm2) %>% 
+  kable(digits = 3, 
+        caption = "Statistics of the model excluding country but including region") %>% 
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r lm2-avPlots,cache=T,fig.height=9,fig.width=8,fig.cap="Added variable plots for the model without country intercept"}
+par(mfrow = c(4, 3), mar = c(4, 4, 1, 1))
+walk(names(coefficients(lm2))[2:12], 
+     ~avPlots(model = lm2, ask = F, terms = ., cex = 0.5))
+```
+
+Then we build a model excluding `Country.Territory` while including `Region`. Table \@ref(tab:lm2-rmse) summarizes the statistics for this model. Unsurprisingly, we arrive at a much lower $R^2$ and higher RMSE after replacing `Country.Territory` with `Region`. But the potential overfitting problem is somehow corrected according to the RMSE. 
+
+The model diagnosis in figure \@ref(fig:lm2) doesn't shows that there's no serious model assumptions violated. There is a slight downward trend in the variance versus the fitted values, indicating that the variance is somewhat related to the fitted values but in general, nothing worth concerning about. We don't see any influntial points based on the "Residual vs. Leverage" plot either. 
+
+However, the added-variable plots in Figure \@ref(fig:lm2-avPlots) imply some problems. The majority of points in the added-variable plots of `Population` and `GDP` cluster together, with a few points lying far away and dragging the partial-regression lines. This is because `Population` and `GDP` have large order of magnitudes compared to other predictors and are heavily right-tailed, as discussed before. Therfore, we will create a new predictor called `GpC` to denote the GDP per capita. Also, transformation will be considered, in the next section.
+
+```{r add-GpC}
+data_fullrec <- data_fullrec %>% 
+  mutate(GpC = GDP / Population) %>% 
+  dplyr::select(-Country.Territory, -Population, - GDP)
+data.train <- data_fullrec %>% filter(Year != 2018)
+data.test <- data_fullrec %>% filter(Year == 2018)
+```
+
+```{r lm3,fig.height=4,fig.width=6,fig.cap="Model diagnosis for the model with GDP per capita (GpC)"}
+# linear model 3: with GpC
+lm3 <- lm(Happiness ~ ., data = data.train)
+summary(lm3) %>% .["coefficients"] %>%
+  kable(digits = 3,
+        caption = "Coefficients summary for the model with GDP per capita (GpC)") %>%
+  kable_styling(latex_options = "hold_position")
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+plot(lm3, cex = 0.5, las = 0.5, cex.caption = 0.8)
+
+# make prediction, get rmse and r2
+ypred.lm3.train <- predict(lm3, data.train)
+ypred.lm3.test <- predict(lm3, data.test)
+rmsetable.lm3 <- data.frame(RMSE.train = RMSE(ypred.lm3.train, ytrue.train),
+                            RMSE.test = RMSE(ypred.lm3.test, ytrue.test))
+r2table.lm3 <- data.frame(R2 = summary(lm3)$r.squared,
+                          R2adj = summary(lm3)$adj.r.squared)
+```
+
+Replacing `Population` and `GDP` with `GpC`, we build a new model. Table \@ref(tab:lm3) shows the coefficients estimates and the t-test for this model, and figure \@ref(fig:lm3) shows the model diagnosis. Again, there are no identifiably serious problems in the model diagnosis. But a noticeable result is that the coefficient estimates of `GpC` is extremely large compared to others. We stop this section here at this model, and in the following section, tranformation will be considered to see if there can be further improvement.
+
+## Transformation
+
+```{r transform,cache=T}
+# make all variables positive in order to do transformation
+data_fullrec_p <- data_fullrec[,-12] %>%
+  mutate_if(~min(.) < 0, ~(. - min(.) + 1)) %>%
+  cbind(Region = data_fullrec[,12]) %>% 
+  relocate(Happiness)
+
+bctrans <- powerTransform(data_fullrec_p[,-13], family = "bcPower")
+
+# decide power
+bctrans.power <- summary(bctrans)$result %>% .[,"Rounded Pwr"] %>% round(1)
+# powers 0, 0.5, -0.5, 1 are interpretable; round others to integer
+bctrans.power.round <- bctrans.power
+bctrans.power.round[which(!bctrans.power %in% c(0, 0.5, -0.5, 1))] <-
+  round(bctrans.power[which(!bctrans.power %in% c(0, 0.5, -0.5, 1))])
+# further modification
+bctrans.power.round["Support"] <-
+  bctrans.power.round["Health"] <-
+  bctrans.power.round["Corruption"] <- 1
+bctrans.power.round["Freedom"] <- 2
+
+data.frame(summary(bctrans)$result,
+           "Decided Pwr" = bctrans.power.round %>% as.character()) %>%
+  mutate_at("Rounded.Pwr", ~round(., 1)) %>%
+  set_rownames(names(bctrans.power.round)) %>%
+  kable(digits = 2, align = "r",
+        caption = "bcPower Transformations to Multinormality") %>%
+  kable_styling(latex_options = "hold_position")
+
+# Finalized transformed data, following modeling uses this data.frame
+data_trans <- data_fullrec_p %>%
+  mutate(GpC = log(GpC),
+         Negative = log(Negative),
+         Support = Support^bctrans.power.round["Support"],
+         Health = Health^bctrans.power.round["Health"],
+         Freedom = Freedom^bctrans.power.round["Freedom"],
+         Generosity = Generosity^bctrans.power.round["Generosity"],
+         Corruption = Corruption^bctrans.power.round["Corruption"],
+         Positive = Positive^bctrans.power.round["Positive"],
+         Government = Government^bctrans.power.round["Government"],
+         Gini.Index = Gini.Index^bctrans.power.round["Gini.Index"],
+         Happiness = Happiness^bctrans.power.round["Happiness"])
+```
+
+The recommended Box-Cox power transformation is shown in table \@ref(tab:transform), and the last column summarizes our *finally decided power transformation*. Here are our decided transformations:
+
+1. There are two predictors `GpC` and `Negative` whose rounded recommended power are 0 and thus need log transformation.
+
+2. `Government` and `Gini.Index` is recommended the power 0.5 and -0.5 respectively, meaning that square root and the inverse square root transformation will be helpful.
+
+3. The recommended power for the response `Happiness` is 2, so square transformation will be applied.
+
+4. There are three predictors `Support`, `Health` and `Corruption` having clearly larger powers compared to others. Look at the histograms in figure \@ref(fig:EDA-Hist), then we can notice that these three variables are all left-skewed. In fact, it is commonly seen that variables with this kind of distributions will be recommended a large power by Box-Cox transformation in which indeed a maximim likelihood estimation is going on. But here, two facts support us not to do the recommended transformations on these variables: 1) we desire a more understandable and interpretable models, 2) the large power will significally scaling up or down the range of the variables, may leading to completely non-comparable coefficients estimates with others. 
+
+5. For the rest of the variables, we refer to the recommended powers. Basically, they are all using square transformation.
+
+```{r lm4,cache=T,fig.height=3.5,fig.width=6.5,fig.cap="Model diagnosis for the model after transfomation"}
+# split the data after transformation
+data.train.trans <- data_trans %>% filter(Year != 2018)
+data.test.trans <- data_trans %>% filter(Year == 2018)
+# linear model 4: after transformation
+lm4 <- lm(Happiness ~ ., data = data.train.trans)
+summary(lm4) %>% .["coefficients"] %>%
+  kable(digits = 3,
+        caption = "Coefficients summary for the model after transfomation") %>%
+  kable_styling(latex_options = "hold_position")
+# # residual plots
+# par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+# plot(lm3, cex = 0.5, las = 0.5, cex.caption = 0.8)
+# make prediction, get rmse and r2
+ypred.lm4.train <- predict(lm4, data.train.trans) %>% sqrt()
+ypred.lm4.test <- predict(lm4, data.test.trans) %>% sqrt()
+rmsetable.lm4 <- data.frame(RMSE.train = RMSE(ypred.lm4.train, ytrue.train),
+                            RMSE.test = RMSE(ypred.lm4.test, ytrue.test))
+r2table.lm4 <- data.frame(R2 = summary(lm4)$r.squared,
+                          R2adj = summary(lm4)$adj.r.squared)
+```
+
+```{r lm4-avPlots,cache=T,fig.height=9,fig.width=8,fig.cap="Added variable plots for the model after transfomation"}
+par(mfrow = c(4, 3), mar = c(4, 4, 1, 1))
+walk(names(coefficients(lm4))[2:12], 
+     ~avPlots(model = lm4, ask = F, terms = ., cex = 0.5))
+```
+
+```{r lm34-compare}
+rbind(rmsetable.lm3, rmsetable.lm4) %>% 
+  cbind(rbind(r2table.lm3, r2table.lm4)) %>% 
+  set_rownames(c("Model before transformation", "Model after transformation")) %>% 
+  kable(digits = 3,
+        caption = "Comparison between models before and after transformation") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+After the variable transformation, we build a linear regression model and see the following improvements:
+
+1. The added-variable plots shown in figure \@ref(fig:lm4-avPlots) are much better than before. For each of the variables, the points are evenly scattered in general. Also, these plots can imply some potential outliers or influential points, such as the 493rd and the 776th observations; but overall, they are not quite outlying. 
+
+2. In addition, as shown in table \@ref(tab:lm4), the coefficients estimates for all the predictors are basically of similar scales. 
+
+3. In terms of the RMSE and $R^2$ statistics, the improvement brought by transformation is slight, as shown in table \@ref(tab:lm34-compare). We somewhat increase the model fit on the training data, while making slightly worse prediction on the test data. Generally speaking, the transformed predictors have better explainatory ability on the response according to $R^2$. 
+
+## Interactions and Model Selection
+
+Now it's time to consider possible interactions among predictors. To guarantee the interpretability of the model, we limit the highest order of interaction to be 2. 
+
+```{r lm5,cache=T}
+# linear model 5: AIC
+lm5 <- lm(Happiness ~ .^2, data = data.train.trans)
+lm5.AIC <- step(lm5, direction = "backward", k = 2, trace = F)
+# make prediction, get rmse and r2
+ypred.lm5.train <- predict(lm5.AIC, data.train.trans) %>% sqrt()
+ypred.lm5.test <- predict(lm5.AIC, data.test.trans) %>% sqrt()
+rmsetable.lm5 <- data.frame(RMSE.train = RMSE(ypred.lm5.train, ytrue.train),
+                            RMSE.test = RMSE(ypred.lm5.test, ytrue.test))
+r2table.lm5 <- data.frame(R2 = summary(lm5.AIC)$r.squared,
+                          R2adj = summary(lm5.AIC)$adj.r.squared)
+```
+
+```{r lm6,cache=T}
+# linear model 6: BIC
+lm6 <- lm(Happiness ~ .^2, data = data.train.trans)
+lm6.BIC <- step(lm6, direction = "backward", k = log(nrow(data.train.trans)),
+                trace = F)
+# make prediction, get rmse and r2
+ypred.lm6.train <- predict(lm6.BIC, data.train.trans) %>% sqrt()
+ypred.lm6.test <- predict(lm6.BIC, data.test.trans) %>% sqrt()
+rmsetable.lm6 <- data.frame(RMSE.train = RMSE(ypred.lm6.train, ytrue.train),
+                            RMSE.test = RMSE(ypred.lm6.test, ytrue.test))
+r2table.lm6 <- data.frame(R2 = summary(lm6.BIC)$r.squared,
+                          R2adj = summary(lm6.BIC)$adj.r.squared)
+```
+
+```{r lm7,cache=T}
+set.seed(521)
+design_mat.train <- model.matrix(~ .^2, data = data.train.trans[,-1])
+design_mat.test <- model.matrix(~ .^2, data = data.test.trans[,-1])
+# linear model 7: lasso
+lm7.lasso.cv <- cv.glmnet(design_mat.train, data.train.trans$Happiness, alpha = 1)
+lm7.lambda <- lm7.lasso.cv$lambda.1se
+# plot(lm7.lasso.cv$glmnet.fit)
+lm7.lasso <- glmnet(design_mat.train, data.train.trans$Happiness,
+                    family = "gaussian", lambda = lm7.lambda, alpha = 1)
+# make prediction, get rmse and r2
+ypred.lm7.train <- predict(lm7.lasso, design_mat.train) %>% sqrt()
+ypred.lm7.test <- predict(lm7.lasso, design_mat.test) %>% sqrt()
+rmsetable.lm7 <- data.frame(RMSE.train = RMSE(ypred.lm7.train, ytrue.train),
+                            RMSE.test = RMSE(ypred.lm7.test, ytrue.test))
+r2table.lm7 <- data.frame(R2 = lm7.lasso$dev.ratio, R2adj = NA)
+```
+
+```{r ModSelection-compare,cache=T}
+ModSelectionTable <- 
+  rbind(rmsetable.lm4, rmsetable.lm5, rmsetable.lm6, rmsetable.lm7) %>%
+  cbind(rbind(r2table.lm4, r2table.lm5, r2table.lm6, r2table.lm7)) %>%
+  mutate(
+    "Num of Params" = c(length(coef(lm4)), length(coef(lm5.AIC)),
+                        length(coef(lm6.BIC)), lm7.lasso$df+1),
+    "Max Dev" = c(max(abs(ypred.lm4.test - ytrue.test)),
+                            max(abs(ypred.lm5.test - ytrue.test)),
+                            max(abs(ypred.lm6.test - ytrue.test)),
+                            max(abs(ypred.lm7.test - ytrue.test))),
+    "Bias" = c(mean(ypred.lm4.test - ytrue.test),
+               mean(ypred.lm5.test - ytrue.test),
+               mean(ypred.lm6.test - ytrue.test),
+               mean(ypred.lm7.test - ytrue.test))
+  ) %>%
+  relocate(`Num of Params`) %>% 
+  dplyr::select(-R2adj) %>%
+  set_rownames(c("Model without interactions",
+                 "Backward AIC", "Backward BIC", "Lasso"))
+ModSelectionTable %>% 
+  kable(digits = 3,
+        caption = "Comparison between model selection and shrinkage estimates") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+There are a total of `r length(coef(lm5))` main effects and 2-order interactions in the model. We conduct backward AIC, BIC to do model selection and also do lasso shrinkage estimation. The statistics results are summarized in table \@ref(tab:ModSelection-compare). 
+
+As a result, the model selected by AIC has the highest $R^2$; this is an unsurprising result since AIC tends to select a large model to ensure the best predictive ability. On the contrary, BIC selects a much smaller model, involving `r length(coef(lm6.BIC))` terms. Lasso provides a model of a middle size, smaller than AIC while larger than BIC. 
+
+Our final choice is the BIC model selection, due to the following reasons: 1) it provides a small model which can be easily interpreted; 2) comparing the results of Lasso and BIC, then we can note that the additional `r lm7.lasso$df+1-length(coef(lm6.BIC))` terms from BIC to Lasso don't bring in too much improvement in $R^2$ and RMSE; 3) BIC results in a model with the smallest bias, meaning that on average, the prediction error is the lowest.  
+
+## Final Model
+
+Our final model is the model selected by backward BIC from the full models that include all the main effects and their 2-order interactions. Table \@ref(fig:final-model) shows the coefficents estimates, the 95% confidence intervals as well as the p-value in the t-test. The final model includes `r length(coef(lm6.BIC))` terms, where 20 are main effects and `r length(coef(lm6.BIC))-20` are 2-order interactions.
+
+```{r final-model,cache=T,fig.height=4,fig.width=6,fig.cap="Model diagnosis for the final model"}
+# final model: BIC
+lm.final <- lm6.BIC
+# coefficients table
+data.frame(coef(lm.final), confint(lm.final)) %>% 
+  rownames_to_column("Predictor") %>% 
+  mutate("Pr(>|t|)" = summary(lm.final)$coefficients[,"Pr(>|t|)"] ) %>% 
+  set_colnames(c("Predictor", "Estimates", "2.5%", "97.5%", "Pr(>|t|)")) %>%
+  kable(digits = 3,
+        caption = "Coefficients estimates of the final model", row.names = T) %>%
+  kable_styling(latex_options = "hold_position")
+# model diagnosis
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+plot(lm.final, cex = 0.5, las = 0.5, cex.caption = 0.8)
+```
+
+The diagnosis plots look even better than previous plots, providing enough evidence that our linear model is suitable on our datset. The "Residual vs. Fitted" plot is a null plot and we do not see any heteroscedasticity in the residuals. The normal Q-Q plot shows that the residuals follow a normal distribution in general, except for the tail regions. The leverage plot shows that there are no influencial points. 
+
+All included variables show significance in the t-test, though few interactions are less significant. To explain our model, and demostrate how some of the variables affect the estimate of `happiness`, we will select a couple of the relatively more important variables to elaborate on, such as `Support`, `Negative`, `GpC`, `Curruption`, `RegionSoutheast Asia`, `RegionLatin America and Caribbean`, `RegionMiddle East and North Africa`, `Corruption:RegionWestern Europe`. 
+
+As mentioned in the introduction, the variables that measure the subjective feeling collected from the surveys are unitless, so we evaluate them based on their transformed values. 
+The baseline `Happiness` score is -255.269 but has no practical meaning because there are no countries with all predictors being 0. However, as thee value of each variable increases in our final model, `Happiness` decreases or increases accordingly. 
+
+- For example, if a country's `Support` increases by 1 unit, the estimated squared happiness index will increases by 36.994 with a 95% confidence interval ranging from 17.84 to 56.152 units. 
+
+- The coefficient of `Negative` is -30.048, indicating that a country's squared happiness index will on average decrease by 2.86 with a with a 95% confidence interval ranging from 4.17 to 1.55 units if the average of three negative affect measures (worry, sadness and anger) increase by 10%. 
+
+- The coefficient of `GpC` is -22.132, indicating that a country's squared happiness index will on average decrease by 2.11 with a with a 95% confidence interval ranging from -2.86 to -1.35 units if the average of three negative affect measures increase by 10%. 
+
+- The coefficient of `Corruption` is 203.068, indicating that a country's squared happiness index will on average increase by 203.068 with a with a 95% confidence interval ranging from  141.321 to 264.816 units if the average of a country's corruption score increase by 1 unit. This is a bit counter-intuitive, and we will discuss this later.
+
+- The coefficient of `RegionSoutheast Asia` is 111.158, indicating that a country's squared happiness index will on average increase by 111.158 with a with a 95% confidence interval ranging from  58.712 to 163.603 units if the country is in Southeast Asia.
+
+- The coefficient of `RegionLatin America and Caribbean` is 73.197, indicating that a country's squared happiness index will on average increase by 73.197 with a with a 95% confidence interval ranging from  50.119 to 96.276 units if the country belongs to the Latin America and Caribbean region.
+
+- The coefficient of `RegionMiddle East and North Africa` is 73.197, indicating that a country's squared happiness index will on average increase by 73.342 with a with a 95% confidence interval ranging from 48.215 to 98.469 units if the country belongs to the Middle East and North Africa region.
+
+- The coefficient of `Corruption:RegionWestern Europe` is -42.986, indicating that a country's squared happiness index will on average decrease by 42.986 with a with a 95% confidence interval ranging from 55.236 to 30.737 units if the average of a country in Western Europe and its corruption score increases by 1 unit. 
+
+This model gives a good intuition to the important factors that contribute to the change of squared happiness index in a given country and is relatively easy to interpret. The corruption level affects the squared happiness index more negatively for a country in Western Europe than for a country in Southeast Asia. This could be interpreted from a few different levels. First, a country in Western Europe would likely to have a have higher living standards (higher GDP per Capital) and a more democratic government than a country from Southeast Asia, so with the basic material needs met and more political freedom, any increasee in the corruption level would be perceived as more intensely, and thus reflected in the relative larger decrease in the squared happiness index. 
+
+Nevertheless, one potential drawback is that some of the predictors have the opposite effect on squared happiness index because there are interaction terms that are highly correlated with them and hence they need to balance their explainatory power by taking opposite signs from each other. For example, it makes no sense that the increasing in the level of corruption in a country indicates a significant increase in their squared happiness index. This is because there are many interaction terms taking `Corruption` into account. For instant, an increase in `Corruption:RegionWestern Europe` is associated with a decrease in squared happiness index. In addition, although it is obvious that a country's GDP per Capital should be positively correlated with the squared happiness index since a country's economy determines people's ability to have sufficient material goods, `GpC` has a negative effect on `Happiness` here, and that is also potentially due to the interaction terms that contain `GpC`, with similar reasons as `Corruption`. If we only look at the interaction terms of GpC with regions, we find that a 10% increase in `GpC` for a country that's in Western Europe has much less significant impact on `Happiness` than the same proprtion of increase in `GpC` for a country that's in the Southeast Asia region or the region containing Middle East annd North Afria. This is reasonable since there are much more developed countries in Western Europe and their GDP per Capita is generally higher than the countries in other two regions. Due to the concept of diminished marginal untility in economy, higher GDP or more material goods would only bring so much utility (which can be thought of as the enjoyment that something brings) upto a certain point. Hence, although a 10% increase in `GpC` for a country in Southeast Asia, Middle East, or North Afria would be less in absolute amont of value than the same percent increase for a country in Western Europe, the former one is associated with a much higher squared happiness index for its people.
+
+
+# Summary and Conclusion
+## Report for the United Nations
+
+In making an effort to analyze the world's happiness index, we will first present you with the best model that we built to explain some of the underlying factors that affect countries’ happiness index across the world, and then use 4 smaller models to further discover some factors' different impacts on a country's happiness index given its general geographical location. 
+
+#### General model 
+
+To build a model that would fit on any country in the world given relavant information, we grouped the countries by regions rather than using each individual country as separate predictors in the model. This helps us to achieve generalizability of the model on a broader range of countries that may not be included in our given dataset. We also created the variable `GpC` to better capture the information a country's GDP and population. We did transformations on a couple of the variables which can be found in section 3 with detailed explaination and procedures. In particular, we squared the happiness index, but since it doesn't have units in the first place, we can evaluate it based on its relative value after such transformation.
+
+We fit a linear model using BIC model selection method, selecting the best predictors for a large pool of variables containing all possible interaction terms to in order to capture the combined effects of any given two original predictors. The best BIC model yields 47 significant predictors that affect the squared happiness index in different degrees. 
+
+Here are a couple of important findings that were also mentioned earlier: 
+- If a country's score for `Support`, i.e., the national average response to the question _"If you were in trouble, do you have relatives or friends you can count on to help you whenever you need them, or not?"_ --with 1 indicating _"yes"_, increases by 1 unit, the estimated increase of `Happiness` is about 6.08, and we are 95% confident that this increase is within the range from 4.223 to 7.49 units. 
+- With a 10% increase in `Negative`, i.e., the average of measures of worry, sadness and anger, a country's squared happiness index will on average decrease by 5.48, and we are 95% confident that this decrease is within the range from 6.614 to 4.04 units. 
+- If the average of a country in Western Europe and its corruption level increases by 1 unit, then its squared happiness index will on average decrease by 6.56, and we are 95% confident that this decrease is within the range from 7.43 to 5.54 units. 
+
+This finding supports the common assumption that countries' squared happiness index would be affected differently by the same predictors if they are located in different regions, and we want to examine regional differences on the biggest factors that contribute to happiness. 
+Although the model is a good fit (see section 5 for model evaluation), it has one drawback makes the model a bit difficult to interpret if we just look at individual predictors. This is because with different interation terms including a combinationn of individual predictors many times, the explainatory power has to even out among the similar predictors to avoid inflating the prediction level. Therefore, we built a few smaller models given specified region and without interaction terms for further exploration of the factors. Again, since the aim of the following models is to provide a general idea of imporant factors to different regions, we roughly combined the regions according to continents, and only selected 4 major continents to evaluate. Note that the region group for `Africa` includes the region of `Middle East and North Africa`, so when we refer to Africa later, it includes countries in the Middle East as well. 
+
+#### Smaller regional models
+
+```{r cache=T,fig.height=3.5,fig.width=6.5,fig.cap="BIC Models by Region"}
+Europe <- data_trans %>% 
+  filter(grepl("Europe", Region)) %>% 
+  select(-Region)
+Asia <- data_trans %>% 
+  filter(grepl("Asia", Region)) %>% 
+  select(-Region)
+Africa<- data_trans %>% 
+  filter(grepl("Africa", Region)) %>% 
+  select(-Region)
+America<- data_trans %>% 
+  filter(grepl("Am", Region)) %>% 
+  select(-Region)
+
+regional.lm <- function(data_region) {
+  lm <- lm(Happiness ~ ., data = data_region)
+  summary(lm)
+  lm.BIC <- step(lm, direction = "backward", k = log(nrow(data_region)),
+                trace = F)
+  lm.BIC
+}
+
+# coefficient tables for each regional model
+data.frame(coef(regional.lm(Europe)), confint(regional.lm(Europe)), 
+           round(glance(regional.lm(Europe))$p.value, 3)) %>% 
+  set_colnames(c("Estimates", "2.5%", "97.5%", "p-value")) %>%
+  kable(digits = 3,
+        caption = "Coefficients estimates of Countries in Europe") %>%
+  kable_styling(latex_options = "hold_position")
+
+data.frame(coef(regional.lm(Asia)), confint(regional.lm(Asia)), 
+           round(glance(regional.lm(Asia))$p.value, 3)) %>% 
+  set_colnames(c("Estimates", "2.5%", "97.5%", "p-value")) %>%
+  kable(digits = 3,
+        caption = "Coefficients estimates of Countries in Asia") %>%
+  kable_styling(latex_options = "hold_position")
+
+data.frame(coef(regional.lm(Africa)), confint(regional.lm(Africa)), 
+           round(glance(regional.lm(Africa))$p.value, 3)) %>% 
+  set_colnames(c("Estimates", "2.5%", "97.5%", "p-value")) %>%
+  kable(digits = 3,
+        caption = "Coefficients estimates of Countries in Africa") %>%
+  kable_styling(latex_options = "hold_position")
+
+data.frame(coef(regional.lm(America)), confint(regional.lm(America)), 
+           round(glance(regional.lm(America))$p.value, 3)) %>% 
+  set_colnames(c("Estimates", "2.5%", "97.5%", "p-value")) %>%
+  kable(digits = 3,
+        caption = "Coefficients estimates of Countries in America") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+In the models by region, we are using the BIC model selection method on the transformed predictors used for our final model in the previous part. However, we are not considering interaction terms for straight-forward interpretation since we want to provide you with an overall idea of what factors are more important for countries in different region groups.
+
+- The most influncial factors on the squared happiness index for a country in Europe are `Corruption` and `GpC` while `Year` and `Freedom` are the least influctial ones. We see that with 10% increase in an European country's GDP per Capita, its squared happiness index will increase by 0.385 and we are 95% confident that the average increase will be between 0.26 and 0.51.
+
+- The best BIC model for countries in Asia only has three signficiant factors left not counting the intercept: `Generosity`, `GpC`, and `Health.` For this particular model, intercept doesn't have a large influence at all on the squared happiness index comparing to other predictors. Note that `Generosity` here indicates how lack of donation this country is accordinng to its GDP per Capita level and `Health` measures the life expectancies in years.
+
+- The best BIC model for countries in Africa has the predictors' importance level relatively evenly distributed amongthe intercept term and its 4 factors: `Generosity`, `GpC`, and `Gini.Index`, and `Positive.` The `Gini.Index` is the Gini Index of household income while `Positive` is the average of three positive affect measures: happiness, laugh and enjoyment.
+
+- The model for countries in America also has the predictors' importance level relatively evenly distributed amongthe intercept term and its 4 factors: `Freedom`, `Positive`, and `Negative`, and `GpC`. Note that `Freedom` measures how satisfied people are with their freedom to choose what to do with their lives, and `Negative` is the average of three negative affect measures: worry, sadness and anger.
+
+We see that the biggest factors on squared happiness index are different for countries in different regions yet all the models include GDP per Capita, which makes sense as the economy is critical to the country's well-bring as mentioned before. We will not dive into the detailed interpretations of the  predictors since we are more interested in the overall difference and commonalities. Here are some interesting findings and conclusions:
+
+- `Corruption` and `Year` are two unique factor for the European countries, and we interpreted that as those countries are more sensitive to the corruption in the institutions and their squared happiness index increases as time proceeds.
+
+- Countries in Africa tend to correlate positivity (happiness, laugh and enjoyment) with more happiness while countries in America tend to correlate negativity (worry, sadness and anger) with less happiness.
+
+- We also see here that countries in Asia and Africa tend have their squared happiness index highly correlated with with their generosity index.
+
+In conclusion, the findings are very intriguing and it is true that countries in different regions have different factors that affect the people's happiness. This result could be improved by looking into the factors by even finer geographical partition. 
+
+
+# Evaluation
+
+In previous sections, brief evaluations are conducted along with the modeling procedure. In this section, we provide an final evaluation on our final model.
+
+```{r evaluation,fig.width=4.5,fig.height=3.5,fig.cap="Model evaluation: coverage of the final model",cache=T}
+predictiontable <- 
+  predict(lm.final, data.test.trans, interval = "prediction") %>% sqrt() %>% 
+  as.data.frame() %>% 
+  mutate(ytrue = ytrue.test)
+coverage <- predictiontable %>% 
+  mutate(within = ((ytrue <= upr) & (ytrue >= lwr))) %>% pull(within) %>% 
+  mean()
+ModSelectionTable[3,] %>% 
+  select(`Num of Params`, R2, RMSE = RMSE.test, `Max Dev`, Bias) %>% 
+  cbind(coverage) %>% 
+  set_rownames("Final Model") %>% 
+  kable(digits = 3, caption = "Evaluation of the final model") %>% 
+  kable_styling(latex_options = "hold_position")
+predictiontable %>% 
+  ggplot() + 
+  geom_ribbon(aes(x = fit, y = ytrue, ymin = lwr, ymax = upr), 
+              fill = "#8aabc7", alpha = .5) +
+  geom_point(aes(x = fit, y = ytrue), size = .8, color = "#363636") +
+  theme_bw(base_size = 11) + labs(x = "Predicted value", y = "True value")
+```
+
+```{r evaluation-plot,fig.width=4.5,fig.height=3,fig.cap="Model evaluation: response distribution with transformation"}
+ggplot(data = data_trans) +
+  geom_histogram(aes(x = Happiness, y = ..density..), 
+                 color = "white", alpha = .7) +
+  geom_density(aes(x = Happiness), color = "#363636", alpha = 0.7, size = 1) +
+  geom_line(aes(x = Happiness, 
+                y = dnorm(Happiness, mean = mean(Happiness), sd = sd(Happiness))),
+            size = 1, color = "#8aabc7") +
+  theme_bw(base_size = 11)
+```
+
+Table \@ref(tab:evaluation) summarizes the statistics for our final model. 
+
+$R^2=$ `r round(ModSelectionTable[3,"R2"], 3)` shows that our model has fairly good explanotory ability on the response `Happiness`. The bias is also low, indicating that on average, the prediction error is low. 
+
+However, the maximum deviation and coverage suggest some limitations of our model. In the worst prediction, we make an error greater than 2; also, our prediction intervals only capture `r round(coverage*100,2)`% of the true values, lower than the desired 95% level. From figure \@ref(fig:evaluation) we can see that we make both overestimation and underestimation, while the underestimation cases are slightly more frequent than the overestimation, resulting in a negative bias. 
+
+Why this is the case? Remember a coverage ratio lower than the nominal confidence level implies that some model assumptions may be not suitable on our dataset. Since here we have pretty ideal residual plots (as shown in \@ref(fig:final-model)), then the only problem can be with the Q-Q plot, i.e., with the normality assumption. Indeed, this is true. In figure \@ref(fig:evaluation-plot) we plot the empirical density and the theoretically normal density of the response after transformation. Note that there is a slight deviation from the empirical density to the normal, which is a potential reason for the coverage being slightly lower than the desired level. But in general, the empirical distribution is close to normal enough, so that our linear model works really well on the dataset and provides good predictions and interpretations.
+

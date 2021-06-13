@@ -1,0 +1,1038 @@
+---
+title: "Final Project Part-II"
+author: "Alpha"
+date: "11/15/2020"
+output:
+  bookdown::pdf_book:
+    toc: FALSE
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+library(tidyverse)
+library(GGally)
+library(car)
+library(randomForest)
+library(BAS)
+library(dbarts)
+library(tree)
+library(BART)
+library(xgboost)
+library(forecast)
+library(reshape2)
+library(gridExtra)
+library(doMC)
+library(foreach)
+
+options(scipen = 0, digits = 4)
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(echo = FALSE, fig.width=4, fig.height=3, fig.align = 'center')
+```
+
+# Introduction
+
+The main topic of the final project part II is to formulate reasonable models and algorithms based on the structure of our data and use test data to assess their prediction accuracy. Instead of directly throwing predictors into different models, we found a main challenge in the data structure: Since we have observations from year 2011 to 2018, it's possible that the observation from the same country in different year could be autocorrelated. Thus, we should also consider a data transformation that can eventually help our models to yield better results. We will talk more about this in Part 2 & 3. Then, in Part 4, we build BMA, single tree model, XGBoost and Random Forest as as our backup models. We also discuss the advantage of whether to use "difference data" and inlcude interactions in this part. After constructing models, we will discuss a model comparison and decide which model has the best performance. 
+
+# Exploratory Data Analysis and Data Processing
+
+## Data Processing
+
+```{r input data, echo = FALSE}
+data <- read.csv("data/happiness_data.csv")
+data_valid <- read.csv("data/happiness_valid.csv")
+submission_result <- read.csv("data/sample_submission.csv")
+CountryInfo <- read.csv("data/CountryInfo.csv")[,-3]
+```
+
+```{r countries with 8 years, echo = FALSE}
+# For simplicity of this report (you might not want to do this in a real-work project and all countries are important), filter out data about these countries only.
+
+UniqueCountry <- c(unique(data$Country.Territory))
+CountList <- c()
+
+for (country in UniqueCountry){
+  CountList <- c(CountList, sum(data$Country.Territory == country))
+}
+
+# check 
+# sum(CountList == 8)
+
+data2 <- filter(data, Country.Territory %in% UniqueCountry[which(CountList == 8)])
+```
+
+```{r train-test-split, echo = FALSE}
+set.seed(0)
+test_index <- (1:nrow(data2))[data2$Year == 2018]
+train_index <- setdiff(1:nrow(data2), test_index)
+
+# Build X_train, y_train, X_test, y_test
+data_train <- data2[train_index,]
+X_train <- data_train[, -ncol(data2)]
+y_train <- data_train[, "Happiness"]
+
+data_test <- data2[test_index,]
+X_test <- data_test[, -ncol(data2)]
+y_test <- data_test[, "Happiness"]
+```
+
+### Following the instruction
+
+As the instruction said, the data contains some countries without all information for 8 years, therefore our first step of the data processing is to filter them out and construct a "clean" dataset such that each country has the data for all 8 years. Then, we can split the full data into training data and testing data. We will use the data from 2011 to 2017 to train our models, and the data for 2018 as the testing data. 
+
+Also, we create a new predictor GDP per capita by dividing `GDP` by `population`, which is a reasonable way to get rid of the effect of different base of GDP and population.
+
+```{r Original-data, echo = FALSE}
+data_ori = data2 %>% 
+  mutate(GpC = GDP / Population) %>% 
+  select(-c(GDP, Population))
+data_ori_valid = data_valid %>% 
+  mutate(GpC = GDP / Population) %>% 
+  select(-c(GDP, Population))
+```
+
+### Taking subtraction to de-correlate the data
+
+```{r Difference-data, echo = FALSE}
+set.seed(0)
+country_list <- unique(data2$Country.Territory)
+data2_diff <- data.frame()
+for (i in country_list) {
+  data_country <- data2[data2$Country.Territory == i, ]
+  for (j in 1:7) {
+    data_country_diff <- data.frame(Country.Territory = i,
+                                    # Year = j,
+                                    GpC = ((data_country[j+1,]$GDP / data_country[j+1,]$Population)
+                                    - (data_country[j,]$GDP / data_country[j,]$Population)),
+                                    Support = data_country[j+1,]$Support - data_country[j,]$Support,
+                                    Health = data_country[j+1,]$Health - data_country[j,]$Health,
+                                    Freedom = data_country[j+1,]$Freedom - data_country[j,]$Freedom,
+                                    Generosity = data_country[j+1,]$Generosity - data_country[j,]$Generosity,
+                                    Corruption = data_country[j+1,]$Corruption - data_country[j,]$Corruption,
+                                    Positive = data_country[j+1,]$Positive - data_country[j,]$Positive,
+                                    Negative = data_country[j+1,]$Negative - data_country[j,]$Negative,
+                                    Government = data_country[j+1,]$Government - data_country[j,]$Government,
+                                    Gini.Index = data_country[j+1,]$Gini.Index - data_country[j,]$Gini.Index,
+                                    Happiness = data_country[j+1,]$Happiness - data_country[j,]$Happiness)
+    data2_diff <- bind_rows(data2_diff, data_country_diff)
+  }
+}
+
+diff_test_index <- seq(from = 7, to = 805, by = 7)
+diff_train_index <- setdiff(1:nrow(data2_diff), diff_test_index)
+
+X_diff <- data2_diff[, -ncol(data2_diff)]
+y_diff <- data2_diff[, "Happiness"]
+
+data2_diff_train <- data2_diff[diff_train_index,]
+X_diff_train <- data2_diff_train[, -ncol(data2_diff_train)]
+y_diff_train <- data2_diff_train[, "Happiness"]
+
+data2_diff_test <- data2_diff[diff_test_index,]
+X_diff_test <- data2_diff_test[, -ncol(data2_diff_test)]
+y_diff_test <- data2_diff_test[, "Happiness"]
+
+data_diff_valid <- data.frame()
+country_list <- data_valid$Country.Territory
+for (i in country_list) {
+  before <- data2 %>%
+    filter(Country.Territory == i, Year == 2018)
+  after <- data_valid[data_valid$Country.Territory == i,]
+  data_country <- bind_rows(before, after)
+  j = 1
+    data_country_diff <- data.frame(Country.Territory = i,
+                                    # Year = j,
+                                    GpC = ((data_country[j+1,]$GDP / data_country[j+1,]$Population)
+                                    - (data_country[j,]$GDP / data_country[j,]$Population)),
+                                    Support = data_country[j+1,]$Support - data_country[j,]$Support,
+                                    Health = data_country[j+1,]$Health - data_country[j,]$Health,
+                                    Freedom = data_country[j+1,]$Freedom - data_country[j,]$Freedom,
+                                    Generosity = data_country[j+1,]$Generosity - data_country[j,]$Generosity,
+                                    Corruption = data_country[j+1,]$Corruption - data_country[j,]$Corruption,
+                                    Positive = data_country[j+1,]$Positive - data_country[j,]$Positive,
+                                    Negative = data_country[j+1,]$Negative - data_country[j,]$Negative,
+                                    Government = data_country[j+1,]$Government - data_country[j,]$Government,
+                                    Gini.Index = data_country[j+1,]$Gini.Index - data_country[j,]$Gini.Index)
+    data_diff_valid <- bind_rows(data_diff_valid, data_country_diff)
+}
+
+lj_hp <- left_join(data_valid, data_test, by = "Country.Territory")
+Happiness2018 <- lj_hp[, ncol(lj_hp)]
+Happiness2018_pred <- lj_hp[, c(1,ncol(lj_hp))]
+
+happy2017 <- unlist(data2 %>%
+  filter(Year == 2017) %>%
+  select(Happiness)) %>% set_names(NULL)
+```
+
+
+
+```{r}
+diff_model_train <- model.matrix(Happiness ~ -1 + ., data = data2_diff_train)
+diff_model_test <- model.matrix(Happiness ~ -1 + ., data = data2_diff_test)
+diff_model_valid <- model.matrix(~-1 + ., data = data_diff_valid)
+diff_model_data2 <- model.matrix(Happiness ~ -1 + ., data = data2_diff)
+
+
+train_name <- colnames(diff_model_train)
+test_name <- colnames(diff_model_test)
+valid_name <- colnames(diff_model_valid)
+data2_name <- colnames(diff_model_data2)
+
+name_diff <- setdiff(train_name, valid_name)
+name_diff2 <- setdiff(data2_name, valid_name)
+
+invalid_ind <- which(train_name %in% name_diff)
+
+diff_model_train <- diff_model_train[,-invalid_ind]
+diff_model_test <- diff_model_test[,-invalid_ind]
+diff_model_data2 <- diff_model_data2[,-invalid_ind]
+```
+
+
+We want to point out that, this dataset is a typical **panel data**, which includes both entities (Countries) and time information (Year). For most of the dataset we've seen in class, values of each observation can be seen as independent. However, for this Happiness data, values in one country across years will be kind of correlated, which is so called autocorrelation.
+
+We will talk more about this problem later in **Part 3**. Here what we want to make home is that, due to this problem, we decide to de-correlate the data by performing subtraction between observations of adjacent years in each country, resulting a new dataset containing the increments of each variable in each country. Therefore, when we do prediction, the input predictors are not values of 2019 data but the subtraction value between 2019 and 2018; also, the output response is not the predicted value of happiness in 2019 but the predicted subtraction value between 2019 and 2018.
+
+We will show the advantages of doing this in the model developing part of BMA and Tree models.
+
+### Finding possible interactions
+
+At this point, we no longer need to worry about the interpretability of our model, so we can include more predictors which may help improve our prediction without consider too much about their realistic meaning. 
+
+To find possible interactions quickly, we decide to first fit a linear model with Country as dummy variable and including all other predictors and their interactions. In code it will be: `lm(Happiness ~ Country.Territory + (GpC + Support + Health + Freedom + Generosity + Corruption + Positive + Negative + Government + Gini.Index)^2, data = data2_diff)`.
+
+```{r}
+linear_model_ia <- lm(Happiness ~ Country.Territory + (GpC + Support + Health + Freedom + Generosity +
+                    Corruption + Positive + Negative + Government + Gini.Index)^2, data = data2_diff)
+```
+
+And then, we use `step()` function to do stepwise algorithm with AIC and BIC. The remaining predictors are shown in formulas:
+
+AIC:
+```{r}
+linear_model_ia_aic <- step(linear_model_ia, trace = 0)
+f = formula(linear_model_ia_aic)
+formula(linear_model_ia_aic)
+```
+
+BIC:
+```{r}
+linear_model_ia_bic <- step(linear_model_ia, k = log(nrow(data2_diff)), trace = 0)
+formula(linear_model_ia_bic)
+```
+
+It is obvious that the model selected by AIC contains more predictors, which not only keeps all the original predictors, but also give us many possible interactions. Due to the fact that we want to have wider variable "space" to explore, we choose all the predictors in the model selected by AIC. 
+
+We will use them and show the advantages of doing this later in the model developing part of ensemble models.
+
+## Exploratory Data Analysis
+
+In this section, we will focus on the EDA of difference data. 
+
+First we can have a look at the overall distribution of the response variable "Happiness". 
+
+```{r, fig.height = 2.5, fig.cap = "Diff Happiness Histogram"}
+ggplot(data = data2_diff) + 
+  geom_histogram(aes(x = Happiness), binwidth = 0.15, color = "#E81828", fill = "#002D72") + 
+  labs(x = "Diff Happiness", y = "Frequency", title = "Diff Happiness Histogram")
+```
+We can see that the response variable "Happiness" has approximately normally distribution with mean 0. 
+
+We can continue to explore the distribution of predictors. 
+
+```{r EDA-boxplot, warning = FALSE, message = FALSE, fig.height = 4, fig.cap = "Predictors boxplot"}
+ggplot(data = melt(data2_diff[,-1])) + 
+  geom_boxplot(aes(x = variable, y = value), color = "#E81828", fill = "#002D72") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+From Figure \@ref(fig:EDA-boxplot) , we can see that most covariates has distribution near symmetric. One noticeable problem is that the predictor "Health" seems to be distributed in a right-skewed shape. Moreover, from the boxplot, we can see that "Health" has generally a extreme outlier. We can estimate its density to confirm these. 
+
+```{r EDA-density, fig.height = 4, fig.cap = "Density plot for Health"}
+ggplot(data = data2_diff) + 
+  geom_density(aes(x = Health), color = "#E81828", fill = "#002D72", alpha = 0.7) + 
+  labs(x = "Health", y = "Density", caption = "Density plot for Health")
+```
+
+Indeed, from Figure \@ref(fig:EDA-density) we can observe a slight right-skewed pattern in the density plot above. We can find out the outlier (Table 1). 
+
+```{r}
+knitr::kable(caption = "Outlier", as.matrix(format(data2_diff[which.max(data2_diff$Health), c(1, 4, 12)], digit = 3)), align = "c")
+```
+
+The existence of outliers also motivates us to focus more on building **ensemble tree models**, which are not going to be significantly affected by outliers. Also we may expect these tree models have better performance than linear models if we don't delete those outliers. 
+
+Besides the original data, we can also have a look at the interactions. 
+
+```{r}
+interaction_dat = as.data.frame(model.matrix(formula(linear_model_ia_aic), data = data2_diff)[,-1])
+```
+
+```{r EDA-boxplot-int, warning = FALSE, message = FALSE, fig.height = 4, fig.cap = "Interaction Boxplot"}
+ggplot(data = melt(interaction_dat[,-c(1:10)])) + 
+  geom_boxplot(aes(x = variable, y = value), color = "#E81828", fill = "#002D72") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+From Figure \@ref(fig:EDA-boxplot-int), we can conclude that interaction terms tend to have smaller magnitude than original data. However, a interesting pattern to notice is that the interaction term containing "Health" have exceptionally large variances and extreme outliers both in positive and negative direction. This could be the result of the distribution of "Health" and thus affected the distribution of interaction terms. Since we will use interaction terms in ensemble tree models, the outliers won't have noticeable effect on the result. On the contrary, due to the fact that interaction terms widen the predictor "space", we may have better result after considering these terms.
+
+
+# Preliminary Model in Part I
+
+As we have said in Part 2, considering the fact that the data might cause autocorrelation issues, we decided to look at the linear model in part 1 and plot its residual to see if we can detect any "sticky" pattern to see if further processing is needed. 
+
+```{r}
+data_part1 = data_train %>% 
+  mutate(GpC = GDP/Population) %>% 
+  mutate(Freedom = Freedom^2) %>% 
+  mutate(Generosity = Generosity^(-2)) %>% 
+  mutate(Positive = Positive^2) %>% 
+  mutate(Negative = log(Negative)) %>% 
+  mutate(Government = Government^0.5) %>% 
+  mutate(Gini.Index = Gini.Index^(-0.5))
+```
+
+```{r residual-plot, echo = FALSE, fig.width = 7, fig.height = 6, fig.cap = "Residual plot"}
+linear_model1 <- lm(Happiness ~ Support + Health + Freedom + Generosity + 
+                      Corruption + Positive + Negative + Government + Gini.Index + 
+                      GpC + Support:Corruption + Health:Government + Health:GpC + 
+                      Freedom:Positive + Freedom:Government + Freedom:GpC + Corruption:GpC + 
+                      Positive:Government + Negative:GpC, 
+                    data = data_part1)
+
+part1_plot <- data.frame(index = 1:805,
+                         residual = linear_model1$residuals,
+                         country = data_train$Country.Territory)
+
+part1_plot1 <- part1_plot[1:399,]
+part1_plot2 <- part1_plot[400:805,]
+
+res_plot1 = ggplot(part1_plot1, aes(x = index, y = residual)) +
+  geom_line() +
+  geom_point(aes(color = country), show.legend = FALSE)
+
+res_plot2 = ggplot(part1_plot2, aes(x = index, y = residual)) +
+  geom_line() +
+  geom_point(aes(color = country), show.legend = FALSE)
+
+grid.arrange(res_plot1, res_plot2, nrow = 2)
+```
+
+Figure \@ref(fig:residual-plot) is the residual plot for the linear model we fitted in Part 1. We plotted it in 2 separate graph for better clarity. In Figure \@ref(fig:residual-plot), each color represents the country of that data point. The first graph is the residual plot for data points of first 57 countries and the second graph is the residual plot for data points of the remaining 58 countries. 
+
+In general, a linear model should have residuals that are normally, independently and identically distributed. However, in Figure \@ref(fig:residual-plot), we can observe obvious "sticky" patterns. Moreover, the data points with the same color tend to have similar trend and when color changes, the trend also changes. Thus, we can conclude that the residuals are correlated and assumptions for linear model is violated. 
+
+Also we can testify this by performing the Durbin-Watson test for autocorrelation of disturbances. 
+
+```{r}
+durbinWatsonTest(linear_model1)
+```
+
+In the Durbin Watson Test, the null hypothesis is autocorrelation equals to 0. In the testing result, we can see that the p-value is close to 0, which means that the null hypothesis is rejected, so we can conclude that the autocorrelation is not 0. 
+
+Thus, for further model training and predictions, we decided to construct the difference/increment data and use non-linear models for our prediction, especially tree models and ensemble tree models.
+
+Also, the final model in part 1 only have test RMSE of about 0.5, which is not ideal on the prediction. That's also another reason why we need to consider more complex models.
+
+# Development of The Final Model
+
+```{r, echo = FALSE}
+RMSE <- function(y_true, y_pred) sqrt(mean((y_true - y_pred)^2))
+```
+
+Due to the fact that we detect the potential outliers and autocorrelation problems, we decide to focus more on tree models and ensemble tree models. Below, we are going to use four models as our options: BMA, single tree model, also ensemble models of XGboost and Random Forest.
+
+For BMA and single tree model, our focus is on comparing the difference between using original data and our "difference data", and also the reasoning or meaning behind the result.
+
+For XGboost and Random Forest, our focus is on finding whether we should include all these interaction terms or not, and also how precise our prediction can be.
+
+## Baseline RMSE for final models
+
+Although it's not required to do this, we also evaluate our models according to the test score from Kaggle leaderboard. Due to the fact that "the leaderboard is calculated with approximately 25% of the test data". So we kind of enlarge our "test data" with this move, and thus made lots of submissions.
+
+The point here is, we did some simple or naive predictions and submit them to Kaggle to get a baseline test RMSE on Kaggle leaderboard for our final models. The following is what we've done:
+
+1. 2018 Happiness data
+
+If someone without any statistical knowledge tries to predict 2019 Happiness, the easiest thing to do is just guessing with the value of 2018 Happiness. This "philosophy" may have something to do with the martingale. No matter what, the point is, prediction models shouldn't do worse than "doing nothing". The Kaggle score of 2018 Happiness data is 0.39415.
+
+2. ARIMA models
+
+If we don't have other predictors information, then this problem will become a total time series problem. That's why we come up with using ARIMA as an origin of our baseline. We automatically build ARIMA models for each country with the function `auto.arima` in the {forecast} package. The Kaggle score of ARIMA models is 0.52110, worse than 2018 Happiness data. This tells us that predicting without other predictors is not reasonable.
+
+```{r}
+country_list <- data_valid$Country.Territory
+arima_pre <- numeric()
+for (i in country_list) {
+  arima_y_i <- data2 %>%
+    filter(Country.Territory == i) %>%
+    select(Happiness)
+  arima_model <- auto.arima(arima_y_i)
+  arima_pre_i <- as.numeric(forecast(arima_model, 1)$mean)
+  arima_pre <- c(arima_pre, arima_pre_i)
+}
+```
+
+The following are all models that we have attempted, including BMA, Tree models, also ensemble models of XGboost and Random Forest.
+
+## BMA
+
+The first model we constructed is the Bayesian Model Averaging with unit information prior, which means set g to be n. We will train two models, one with the original data and another with the difference data for the comparison. For the model using original data, we added a interaction term between "Country" and "Year" to increase accuracy. The training for both model will try to enumerate over possible models with MCMC method. The model prior is set to be uniform.
+
+```{r}
+n_ori = length(train_index)
+n_diff = nrow(data2_diff_train)
+```
+
+```{r BMA-ori, echo = FALSE}
+set.seed(0)
+bmamod_ori = bas.lm(Happiness ~ . + Country.Territory:Year, 
+                data = data_ori[train_index,], 
+                prior = "g-prior", 
+                alpha = n_ori, 
+                n.models = 2^13, 
+                modelprior = uniform(), 
+                method="MCMC")
+
+bmamod_diff = bas.lm(Happiness ~ ., 
+                data = data2_diff_train, 
+                prior = "g-prior", 
+                alpha = n_diff, 
+                n.models = 2^11, 
+                modelprior = uniform(), 
+                method="MCMC")
+```
+
+```{r, echo = FALSE, warning = FALSE}
+ypred_bma_ori = predict(bmamod_ori, newdata = data_ori[test_index,], type = "response")$fit
+ypred_bma_diff = predict(bmamod_diff, newdata = data2_diff_test, type = "response")$fit
+ori_rmse = RMSE(data_ori[test_index,]$Happiness, ypred_bma_ori)
+diff_rmse = RMSE(data2_diff_test$Happiness, ypred_bma_diff)
+knitr::kable(caption = "BMA test RMSE", cbind(c("for original data", format(ori_rmse, digit = 3)), 
+                   c("for difference data", format(diff_rmse, digit = 3))), 
+             align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+We can see that the RMSE for the model using difference data is much lower than that of the model using original data. The result here further confirms that our initial consideration about the dependent observations is correct, and our preprocessing significantly improved prediction result. Thus, we selected the BMA with difference data as our BMA model. 
+
+```{r BMA-image, echo = FALSE, fig.width = 6, fig.height = 4, fig.cap = "BMA Model Rank"}
+image(bmamod_diff, subset = -c(2:115))
+```
+
+In the Figure \@ref(fig:BMA-image), we excluded the predictor "Country.Territory" since there are too many levels. Showing all of them will significantly affect the clarity of the graph. 
+
+Figure \@ref(fig:BMA-image) shows that "Gini Index" is not included in top rank models. Based on common knowledge, Gini Index should be a important measurement of the life quality of population, so here we can conclude that its effect is well explained by other variables. On the other hand, we can see that "Government" and "Negative" are included in rank 3 to 20 models. The top rank model has only the intercept and "Corruption", but lower rank models rarely contain variable "Corruption" together with other variables. This means that the effect of variable "Corruption" could be explained by other variables. Overall, we can see that models can vary quite significantly in BMA, and simple models tend to have higher posterior probability. The model averaging provided a relatively small RMSE, but the true model may not be in our model space above. 
+
+
+## Single Tree Model
+
+### Comparison of Original Data and Difference Data
+
+After BMA, we decided to continue with tree model. Our first step is to fit a single tree and compare the performance of original data and difference data. We will use function `tree()` from package `tree` and compute the RMSE. 
+
+```{r, warning = FALSE, echo = FALSE}
+set.seed(0)
+treemod_diff = tree(Happiness ~ ., data = data2_diff_train)
+treemod_ori = tree(Happiness ~ ., data = data_ori[train_index,])
+```
+
+```{r, warning = FALSE}
+ypred_tree_diff = predict(treemod_diff, data2_diff_test)
+ypred_tree_ori = predict(treemod_ori, data_ori[test_index,])
+rmse_tree_diff = RMSE(data2_diff_test$Happiness, ypred_tree_diff)
+rmse_tree_ori = RMSE(data_ori$Happiness[test_index], ypred_tree_ori)
+```
+
+```{r, warning = FALSE}
+knitr::kable(caption = "test RMSE before pruning", cbind(c("RMSE for original data", format(rmse_tree_ori, digit = 4)), 
+                   c("RMSE for difference data", format(rmse_tree_diff, digit = 3))), 
+             align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+After fitting the models, we can visualize the trees. 
+
+```{r treeimg1, fig.width = 8, fig.height = 4, fig.cap = "Regression Tree Visualization"}
+par(mfrow = c(1,2))
+plot(treemod_diff)
+text(treemod_diff, cex = 0.3)
+plot(treemod_ori)
+text(treemod_ori, cex = 0.5)
+```
+
+
+From Figure \@ref(fig:treeimg1), we can see that the RMSE and structure of trees constructed using original data and difference data are completely different. Overall, the tree model using difference data has significantly smaller RMSE and larger tree depth. The obvious disparity between the trees could be the result of the instability of tree models. Overall, the RMSE is not ideal, and the BMA model resulted a smaller RMSE than the single tree model. Thus, we would like to proceed to perform cost-complexty pruning to improve model performance. 
+
+### Cost-Complexity Pruning
+
+Here, we use deviance as our standard for the cost-complexity pruning.
+
+```{r Pruneplot, warning = FALSE, fig.width = 8, fig.cap = "Pruning Process"}
+set.seed(5)
+par(mfrow = c(1,2))
+cv.treemod_diff = cv.tree(treemod_diff, FUN = prune.tree)
+cv.treemod_ori = cv.tree(treemod_ori, FUN = prune.tree)
+diff_plot = ggplot(data = data.frame(size = cv.treemod_diff$size, deviance = cv.treemod_diff$dev), 
+       aes(x = size, y = deviance)) + 
+  geom_line() + 
+  geom_point() + 
+  labs(caption = "Prune for difference data tree")
+ori_plot = ggplot(data = data.frame(size = cv.treemod_ori$size, deviance = cv.treemod_ori$dev), 
+       aes(x = size, y = deviance)) + 
+  geom_line() + 
+  geom_point() + 
+  labs(caption = "Prune for original data tree")
+grid.arrange(diff_plot, ori_plot, ncol = 2)
+```
+
+The Figure \@ref(fig:Pruneplot) shows that the deviance is minimized when $Size = 2$ for the tree model using difference data, while $Size = 7$ gives the best result for tree model using original data. We can continue to refit the tree models and compute their test RMSE. 
+
+```{r Tree2, fig.width = 8, fig.height = 4, fig.cap = "Pruned Trees"}
+par(mfrow = c(1,2))
+prune_treemod_diff = prune.tree(treemod_diff, best = 2)
+prune_treemod_ori = prune.tree(treemod_ori, best = 7)
+plot(prune_treemod_diff)
+text(prune_treemod_diff)
+plot(prune_treemod_ori)
+text(prune_treemod_ori, cex = 0.45)
+```
+
+```{r, warning = FALSE}
+ypred_tree_diff = predict(prune_treemod_diff, data2_diff_test)
+ypred_tree_ori = predict(prune_treemod_ori, data_ori[test_index,])
+rmse_tree_diff = RMSE(data2_diff_test$Happiness, ypred_tree_diff)
+rmse_tree_ori = RMSE(data_ori$Happiness[test_index], ypred_tree_ori)
+```
+
+```{r, warning = FALSE}
+knitr::kable(caption = "test RMSE for Pruned Tree", 
+             cbind(c("for original data", format(rmse_tree_ori, digit = 4)), 
+                   c("for difference data", format(rmse_tree_diff, digit = 3))), 
+             align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+After pruning, we can see that the tree model using original data stays unchanged, thus there is no improvement for the RMSE. On the other hand, the tree model using difference data now has significantly lower tree depth and its RMSE decreased by a considerably amount. Overall, the test RMSE is still slightly larger than the BMA model with unit information prior, but we expect it to continue to improve after we apply ensemble models. 
+
+## XGBoost
+
+For the XGboost model, we use `xgboost()` function in package {xgboost} to do the training. Because of the rule, we set `eval_metric`, evaluation metrics for validation data, to be "rmse". We have three hyperparameters to tune, names and their meanings in the help document are below: 
+
+- `eta`: "control the learning rate: scale the contribution of each tree by a factor of 0 < eta < 1 when it is added to the current approximation. Used to prevent overfitting by making the boosting process more conservative. Lower value for eta implies larger value for nrounds: low eta value means model more robust to overfitting but slower to compute. Default: 0.3".
+
+- `max.depth`: "maximum depth of a tree. Default: 6".
+
+- `nrounds`: "max number of boosting iterations".
+
+### Training process
+
+Here we first build XGboost without possible interactions we've chosen before, and see what the result will be. Then we include those interactions later and see whether there is a difference.
+
+Due to the fact that, smaller `eta` will take us much longer time to train a model, therefore we first set `eta` to be 0.01, a "decent" value as a starting point of the learning rate, and first tune on `max.depth` and `nrounds`. A plot of how test RMSE is changed with `max.depth` from 1 to 8 and `nrounds` from 150 to 300 is shown below:
+
+```{r xg-noia1, cache=TRUE, fig.cap= "test RMSE vs max.depth and nrounds (XGB without Interactions)"}
+try <- seq(from = 150, to = 300, by = 10)
+RMSE_xgb_o <- data.frame()
+for (j in 1:8) {
+  RMSE_xgb2 <- numeric()
+  for (i in try) {
+    xgb2 <- xgboost(
+      data = diff_model_train,
+      label = y_diff_train,
+      params = list(eta = 0.01, eval_metric = "rmse"),
+      max.depth = j,
+      nrounds = i,
+      verbose = 0
+    )
+    xgb2_pred <- predict(xgb2, newdata = diff_model_test)
+    xgb2_pred <- xgb2_pred + happy2017
+    RMSE_xgb2 <- c(RMSE_xgb2, RMSE(y_test, xgb2_pred))
+  }
+  RMSE_xgb_tt <- data.frame(RMSE = RMSE_xgb2, 
+                            i = try,
+                            j = as.character(j))
+  RMSE_xgb_o <- bind_rows(RMSE_xgb_o, RMSE_xgb_tt)
+}
+
+ggplot(RMSE_xgb_o, aes(x = i, y = RMSE, color = j)) +
+  geom_line() +
+  labs(x = "nrounds", y = "test RMSE", color = "max.depth")
+```
+
+From this plot, we can find some clear patterns. First, it's obvious that `max.depth` = 1 out-performs other options of `max.depth`. This result is reasonable because we don't have many predictors now, and boosting algorithm usually can perform well with stumps. Second, `nrounds` = 250 should be a good point of stopping the training. We will be in danger of over-fitting if we go above this point too much.
+
+Setting `max.depth` = 1, then we set `eta` to be 0.001 and try to find optimal `nrounds` again. A plot of how test RMSE is changed with `nrounds` from 1000 to 3000 is shown below:
+
+```{r xg-noia2, cache=TRUE, fig.cap= "test RMSE vs nrounds (XGB without Interactions)"}
+try <- seq(from = 1000, to = 3000, by = 10)
+RMSE_xgb_t <- data.frame()
+RMSE_xgb2 <- numeric()
+for (i in try) {
+  xgb2 <- xgboost(
+    data = diff_model_train,
+    label = y_diff_train,
+    params = list(eta = 0.001, eval_metric = "rmse"),
+    max.depth = 1,
+    nrounds = i,
+    verbose = 0
+  )
+  xgb2_pred <- predict(xgb2, newdata = diff_model_test)
+  xgb2_pred <- xgb2_pred + happy2017
+  RMSE_xgb2 <- c(RMSE_xgb2, RMSE(y_test, xgb2_pred))
+}
+RMSE_xgb_t <- data.frame(RMSE = RMSE_xgb2, i = try)
+
+ggplot(RMSE_xgb_t, aes(x = i, y = RMSE)) +
+  geom_line() +
+  labs(x = "nrounds", y = "test RMSE")
+```
+
+Here we can see that, we truly need much more rounds to get the optimal test RMSE point. The curve of test RMSE gets flat after nrounds of 2500. However, this slow learning rate model doesn't give us much better test RMSE. It seems that `eta` = 0.01 is enough here. 
+
+```{r xg-result1, cache=TRUE}
+xgb2 <- xgboost(
+  data = diff_model_train,
+  label = y_diff_train,
+  params = list(eta = 0.001, eval_metric = "rmse"),
+  max.depth = 1,
+  nrounds = 2500,
+  verbose = 0
+)
+xgb2_pred <- predict(xgb2, newdata = diff_model_test)
+xgb2_pred <- xgb2_pred + happy2017
+RMSE_xgb_final1 <- RMSE(y_test, xgb2_pred)
+```
+
+To sum up, for XGboost without interactions, we choose `eta` to be 0.01, `max.depth` to be 1 and `nrounds` to be 250. Here we can see the first 7 most important features in the model after tuning.
+
+```{r xgb-res2-fig, cache=TRUE}
+xgb.ggplot.importance(xgb.importance(model = xgb2), top_n = 10)
+```
+
+It seems that Negative and Government are the most important order-one predictors, which is consistent with the single tree model which tells us the importance of Government feature.
+
+### Including Interactions
+
+Now we include interactions and go through the procedures above again.
+
+```{r xg-ia1, cache=TRUE}
+# model_ia_data
+
+fc = as.character(f)
+newfc = paste0("Happiness ~ -1 + Country.Territory + ", fc[3])
+newf = as.formula(newfc)
+newfcv = paste0("~ -1 + Country.Territory + ", fc[3])
+newfv = as.formula(newfcv)
+
+
+diff_model_train <- model.matrix(newf, data = data2_diff_train)
+diff_model_test <- model.matrix(newf, data = data2_diff_test)
+diff_model_valid <- model.matrix(newfv, data = data_diff_valid)
+diff_model_data2 <- model.matrix(newf, data = data2_diff)
+
+
+train_name <- colnames(diff_model_train)
+test_name <- colnames(diff_model_test)
+valid_name <- colnames(diff_model_valid)
+data2_name <- colnames(diff_model_data2)
+
+name_diff <- setdiff(train_name, valid_name)
+name_diff2 <- setdiff(data2_name, valid_name)
+
+invalid_ind <- which(train_name %in% name_diff)
+
+diff_model_train <- diff_model_train[,-invalid_ind]
+diff_model_test <- diff_model_test[,-invalid_ind]
+diff_model_data2 <- diff_model_data2[,-invalid_ind]
+```
+
+We also first set `eta` to be 0.01, a plot of how test RMSE is changed with `max.depth` from 1 to 8 and `nrounds` from 150 to 300 is in Figure \@ref(fig:xg-ia2).
+
+```{r xg-ia2, cache=TRUE, fig.cap= "test RMSE vs nrounds (XGB with Interactions)"}
+try <- seq(from = 150, to = 300, by = 10)
+RMSE_xgb_oo <- data.frame()
+for (j in 1:8) {
+  RMSE_xgb2 <- numeric()
+  for (i in try) {
+    xgb2 <- xgboost(
+      data = diff_model_train,
+      label = y_diff_train,
+      params = list(eta = 0.01, eval_metric = "rmse"),
+      max.depth = j,
+      nrounds = i,
+      verbose = 0
+    )
+    xgb2_pred <- predict(xgb2, newdata = diff_model_test)
+    xgb2_pred <- xgb2_pred + happy2017
+    RMSE_xgb2 <- c(RMSE_xgb2, RMSE(y_test, xgb2_pred))
+  }
+  RMSE_xgb_tt <- data.frame(RMSE = RMSE_xgb2, 
+                            i = try,
+                            j = as.character(j))
+  RMSE_xgb_oo <- bind_rows(RMSE_xgb_oo, RMSE_xgb_tt)
+}
+
+ggplot(RMSE_xgb_oo, aes(x = i, y = RMSE, color = j)) +
+  geom_line() +
+  labs(x = "nrounds", y = "test RMSE", color = "max.depth")
+```
+
+Here we get a different result: the best `max.depth` is no longer to be 1. Now it's obvious that we should choose `max.depth` to be 6. This is reasonable because now we have wider predictor "space", which results in deeper depth. On the other hand, `nrounds` = 250 is still a good point of stopping the training. We will also be in danger of over-fitting if we go above this point too much.
+
+To sum up, for XGboost with interactions, we choose `eta` to be 0.01, `max.depth` to be 6 and `nrounds` to be 250. Here we can also see the first 10 most important features in the model after tuning.
+
+```{r xgb-res-fig, cache=TRUE}
+xgb2 <- xgboost(
+  data = diff_model_train,
+  label = y_diff_train,
+  params = list(eta = 0.01, eval_metric = "rmse"),
+  max.depth = 6,
+  nrounds = 250,
+  verbose = 0
+)
+xgb2_pred <- predict(xgb2, newdata = diff_model_test)
+xgb2_pred <- xgb2_pred + happy2017
+RMSE_xgb_final2 <- RMSE(y_test, xgb2_pred)
+
+xgb.ggplot.importance(xgb.importance(model = xgb2), top_n = 10)
+```
+
+It automatically gives us 5 clusters. The government feature is quite important, consistent with the analysis in single tree model. Also, we can see that many interaction terms are included, showing that adding these terms really help us improve the model.
+
+The resulting test RMSE of models after tuning is shown in Table \@ref(tab:xgb-res-tab).
+
+```{r xgb-res-tab, cache=TRUE}
+result_rf <- matrix(c(RMSE_xgb_final1, RMSE_xgb_final2), nrow = 1)
+rownames(result_rf) <- "RMSE"
+colnames(result_rf) <- c("w/o Interaction", "w/ Interaction")
+
+knitr::kable(caption = "test RMSE for XGBoost", result_rf, digit = 3, align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+We can see that the model with interactions truly does better than the one without interactions.
+
+## Random Forest
+
+For the Random Forest model, we use `randomForest()` function in package {randomForest} to do the training. Because the data is naturally stratified, we set `strata` argument according to the Country. Also we set `replace` to be TRUE to allow "sampling of cases be done with replacement", which will let us do the quantification of uncertainty easier.
+
+
+As known to us, bagging algorithm typically has less hyperparameters to tune than boosting. Here, We have two hyperparameters to tune, names and their meanings in the help document are below: 
+
+- `ntree`: "Number of trees to grow. This should not be set to too small a number, to ensure that every input row gets predicted at least a few times".
+
+- `mtry`: "Number of variables randomly sampled as candidates at each split. Default value for regression is p/3".
+
+### Training process
+
+As the same as XGboost, here we first build without possible interactions we've chosen before, and see what the result will be. Then we include those interactions later and see whether there is a difference.
+
+Due to the fact that, for Random Forest, as long as `ntree` is large enough, we don't need to worry too much about its exact value. Therefore, our main focus here is `mtry`. We first set `ntree` to be 2000 to ensure enough number of trees. A plot of how test RMSE is changed with `mtry` from 1 to 5 is shown in Figure \@ref(fig:rf-noia1).
+
+
+```{r rf-noia1, cache=TRUE, fig.cap= "test RMSE vs mtry (RF with Interactions)"}
+set.seed(1)
+
+try <- 1:5
+RMSE_rf21 <- numeric()
+for (i in try) {
+  rf1 <-  randomForest(Happiness ~., data = data2_diff_train,
+                       strata = as.factor(data2_diff_train$Country.Territory),
+                       replace = TRUE,
+                       mtry = i, ntree = 2000)
+  rf1_pred <- predict(rf1, X_diff_test) + happy2017
+  RMSE_rf21 <- c(RMSE_rf21, RMSE(y_test, rf1_pred))
+}
+
+RMSE_rf21 <- data.frame(RMSE = RMSE_rf21, i = try)
+
+ggplot(RMSE_rf21, aes(x = i, y = RMSE)) +
+  geom_line() +
+  labs(x = "mtry", y = "test RMSE")
+```
+
+As shown in Figure \@ref(fig:rf-noia1), we can see that test RMSE get the lowest value when `mtry` is 1. This is reasonable because we don't have many predictors now, so only one variable randomly sampled as candidates at each split. 
+
+Given `mtry` to be 1, then we test whether the input value of `ntree` will affect the result a lot. A plot of how test RMSE is changed with `ntree` from 250 to 5000 is shown in Figure \@ref(fig:rf-noia2).
+
+
+```{r rf-noia2, cache=TRUE, fig.cap= "test RMSE vs ntree (RF without Interactions)"}
+set.seed(1)
+
+try <- seq(250, 5000, 250)
+RMSE_rf22 <- numeric()
+for (i in try) {
+  rf1 <-  randomForest(Happiness ~., data = data2_diff_train,
+                       strata = as.factor(data2_diff_train$Country.Territory),
+                       replace = TRUE,
+                       mtry = 1, ntree = i)
+  rf1_pred <- predict(rf1, X_diff_test) + happy2017
+  RMSE_rf22 <- c(RMSE_rf22, RMSE(y_test, rf1_pred))
+}
+
+RMSE_rf22 <- data.frame(RMSE = RMSE_rf22, i = try)
+
+ggplot(RMSE_rf22, aes(x = i, y = RMSE)) +
+  geom_line() +
+  labs(x = "ntree", y = "test RMSE")
+```
+
+As shown in Figure \@ref(fig:rf-noia2), we can see that the test RMSE will fluctuate even when the `ntree` gets large enough. This result is consistent with the property of Random Forest Algorithm. So here we just need to set `ntree` to be 1000 and it's enough.
+
+```{r rf-noia2-table, cache = TRUE}
+rf1 <-  randomForest(Happiness ~., data = data2_diff_train,
+                     strata = as.factor(data2_diff_train$Country.Territory),
+                     replace = TRUE,
+                     mtry = 2, ntree = 1000)
+rf1_pred <- predict(rf1, data2_diff_test) + happy2017
+RMSE_rf12_final <- RMSE(y_test, rf1_pred)
+```
+
+To sum up, for Random Forest without interactions, we choose `mtry` to be 1 and `ntree` to be 1000. Here we can take a look at the first 7 most important predictors in the model after tuning.
+
+```{r rf-noia2-fig, cache= TRUE}
+varImpPlot(rf1, main = "RF without Interaction", n.var = 7)
+```
+
+The result is quite consistent with the XGboost: Negative and Government are the most important order-one predictors.
+
+### Including interactions
+
+```{r }
+# model_ia_data
+
+fc = as.character(f)
+newfc = paste0("Happiness ~ -1 + Country.Territory + ", fc[3])
+newf = as.formula(newfc)
+newfcv = paste0("~ -1 + Country.Territory + ", fc[3])
+newfv = as.formula(newfcv)
+
+
+diff_model_train <- model.matrix(newf, data = data2_diff_train)
+diff_model_test <- model.matrix(newf, data = data2_diff_test)
+diff_model_valid <- model.matrix(newfv, data = data_diff_valid)
+diff_model_data2 <- model.matrix(newf, data = data2_diff)
+
+
+train_name <- colnames(diff_model_train)
+test_name <- colnames(diff_model_test)
+valid_name <- colnames(diff_model_valid)
+data2_name <- colnames(diff_model_data2)
+
+name_diff <- setdiff(train_name, valid_name)
+name_diff2 <- setdiff(data2_name, valid_name)
+
+invalid_ind <- which(train_name %in% name_diff)
+
+diff_model_train <- diff_model_train[,-invalid_ind]
+diff_model_test <- diff_model_test[,-invalid_ind]
+diff_model_data2 <- diff_model_data2[,-invalid_ind]
+```
+
+Now we include interactions and go through the procedures above again.
+
+```{r rf-ia1, cache=TRUE, fig.cap= "test RMSE vs mtry (RF with Interactions)"}
+set.seed(1)
+
+try <- 1:40
+RMSE_rf1 <- numeric()
+for (i in try) {
+  rf1 <-  randomForest(x = diff_model_train, y = y_diff_train,
+                       strata = as.factor(data2_diff_train$Country.Territory),
+                       replace = TRUE,
+                       mtry = i, ntree = 2000)
+  rf1_pred <- predict(rf1, diff_model_test) + happy2017
+  RMSE_rf1 <- c(RMSE_rf1, RMSE(y_test, rf1_pred))
+}
+
+RMSE_rf1 <- data.frame(RMSE = RMSE_rf1, i = try)
+
+ggplot(RMSE_rf1, aes(x = i, y = RMSE)) +
+  geom_line() +
+  labs(x = "mtry", y = "test RMSE")
+```
+
+Here we get a different result: the best `mtry` is no longer to be 1. Now we'd better choose `mtry` to be 20. This is reasonable because now we have wider predictor "space", which results in more choices. We will be in danger of losing the advantage of bootstrapping in Random Forest if we go above 20 too much.
+
+Given `mtry` to be 20, then we test whether the input value of `ntree` will affect the result a lot. A plot of how test RMSE is changed with `ntree` from 500 to 10000 is shown in Figure \@ref(fig:rf-ia2).
+
+```{r rf-ia2, cache=TRUE, fig.cap= "test RMSE vs ntree (RF with Interactions)"}
+set.seed(1)
+
+try <- seq(500, 10000, 500)
+RMSE_rf12 <- numeric()
+for (i in try) {
+  rf1 <-  randomForest(x = diff_model_train, y = y_diff_train, 
+                       strata = as.factor(data2_diff_train$Country.Territory),
+                       replace = TRUE,
+                       mtry = 20, ntree = i)
+  rf1_pred <- predict(rf1, diff_model_test) + happy2017
+  RMSE_rf12 <- c(RMSE_rf12, RMSE(y_test, rf1_pred))
+}
+
+RMSE_rf12 <- data.frame(RMSE = RMSE_rf12, i = try)
+
+ggplot(RMSE_rf12, aes(x = i, y = RMSE)) +
+  geom_line() +
+  labs(x = "ntree", y = "test RMSE")
+```
+
+As shown in Figure \@ref(fig:rf-ia2), we can see that the test RMSE will also fluctuate even when the `ntree` gets large enough. Here we set `ntree` to be 2500, which is a little larger than the former setting.
+
+To sum up, for Random Forest with interactions, we choose `mtry` to be 20 and `ntree` to be 2500. Here we can also take a look at the first 10 most important predictors in the model after tuning. 
+
+```{r rf-ia2-fig, fig.height=4, cache= TRUE}
+rf1 <-  randomForest(x = diff_model_train, y = y_diff_train, 
+                     strata = as.factor(data2_diff_train$Country.Territory),
+                     replace = TRUE,
+                     mtry = 20, ntree = 2500)
+rf1_pred <- predict(rf1, diff_model_test) + happy2017
+RMSE_rf22_final <- RMSE(y_test, rf1_pred)
+
+varImpPlot(rf1, main = "RF with Interaction", n.var = 10)
+```
+
+The result is also quite consistent with the XGboost: Negative and Government are the most important ones; many interaction terms also help improve the model.
+
+The resulting test RMSE of both models after tuning is shown in Table \@ref(tab:rf-ia2-table).
+
+```{r rf-ia2-table}
+result_rf <- matrix(c(RMSE_rf12_final, RMSE_rf22_final), nrow = 1)
+rownames(result_rf) <- "RMSE"
+colnames(result_rf) <- c("w/o Interaction", "w/ Interaction")
+
+knitr::kable(caption = "test RMSE for Random Forest", result_rf, digit = 3, align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+We can see that the model with interactions truly does better than the one without interactions.
+ 
+## Selecting the final model
+
+Now we can look at the table to select the best model based on testing RMSE. 
+
+```{r, warning = FALSE}
+knitr::kable(caption = "Difference and Original Data test RMSE Comparison", 
+             cbind(c("", "Bayesian Model Averaging", "Pruned Tree Model"), 
+                   c("for original data", format(ori_rmse, digit = 3), format(rmse_tree_ori, digit = 3)), 
+                   c("for difference data", format(diff_rmse, digit = 3), format(rmse_tree_diff, digit = 3))),
+             align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+```{r, warning = FALSE}
+knitr::kable(caption = "With/Without Interaction test RMSE Comparison", 
+             cbind(c("", "XGBoosting", "Random Forest"), 
+                   c("No Interaction", format(RMSE_xgb_final1, digit = 3), 
+                     format(RMSE_rf12_final, digit = 3)), 
+                   c("with Interaction", format(RMSE_xgb_final2, digit = 3), 
+                     format(RMSE_rf22_final, digit = 3))), 
+             align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+It's quite obvious that the XGBoosting Tree Model with interaction has the smallest testing RMSE. Thus, we select XGBoosting Model with interaction as our final model. 
+
+
+# Assessment of the final model
+
+## Point estimates & Prediction intervals
+
+As shown above, our final model will be XGBoost with Interactions. We have already gotten the point estimate when computing the test RMSE. Here the focus will be how we get prediction intervals. We will use Bootstrap to simulate different training data sets and then build our model for each data. Therefore we can get a number of predicting values, where we can derive the prediction interval.
+
+Due to the fact that it takes some time in training model one time, so we decide to only do 1000 times Bootstrap, which means we will get 1000 predicting values for each test point. Also, to accelerate the loop, we use 4 cores paralyzing computing with `foreach()` function.
+
+```{r assessment, cache=TRUE, results='hide', message=FALSE, error=FALSE}
+registerDoMC(4)
+
+assess_matrix <- matrix(nrow = 115, ncol = 1000)
+foreach(i = 1:1000) %do% {
+  diff_model_train_boot <- as.matrix(sample_n(tibble(diff_model_train), nrow(diff_model_train), replace = TRUE))
+  
+  xgb2 <- xgboost(
+  data = diff_model_train,
+  label = y_diff_train,
+  params = list(eta = 0.01, eval_metric = "rmse"),
+  max.depth = 6,
+  nrounds = 250,
+  verbose = 0
+  )
+  
+  xgb2_pred <- predict(xgb2, newdata = diff_model_test)
+  xgb2_pred <- xgb2_pred + happy2017
+  assess_matrix[,i] <- xgb2_pred
+}
+```
+
+The result is shown in Table \@ref(tab:pepi).
+
+```{r pepi}
+PE <- apply(assess_matrix, 1, mean)
+LB <- apply(assess_matrix, 1, function(x) quantile(x, 0.025))
+UB <- apply(assess_matrix, 1, function(x) quantile(x, 0.975))
+
+assess_df <- data.frame(data_test$Country.Territory,
+                        y_test,
+                        PE,
+                        LB,
+                        UB)
+colnames(assess_df) <- c("Country", "True Value", "Point Estimate",
+                         "2.5% Bound", "97.5% Bound")
+
+knitr::kable(caption = "Point Estimates w/ Prediction Intervals", assess_df, 
+             longtable = TRUE, digit = 3, align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+## Evaluation Criteria
+
+The result of each evalutaion criterion is shown in Table \@ref(tab:eval-cri).
+
+```{r eval-cri}
+Bias <- mean(y_test - PE)
+
+MD <- max(abs(y_test - PE))
+
+cov_list <- apply(assess_df, 1, function(x) x[4] <= x[2] & x[5] >= x[2])
+Coverage <- mean(cov_list)
+
+crite <- data.frame("Bias" = Bias,
+                    "Maximum Deviation" = MD,
+                    "test RMSE" = RMSE_rf22_final,
+                    "Coverage" = Coverage)
+
+knitr::kable(caption = "Evaluation Criteria", crite, digit = 3, align = "c") %>% 
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+Compared to our final model in part 1, now we have much better results regarding Maximum Deviation and test RMSE. However, the coverage here is not ideal. It seems that we underestimate the variance of the data. On the other hand, this may be also due to the fact that we only have 1000 iterations of bootstrap to construct our prediction intervals, thus we don't get enough simulations to compute a more precise coverage rate.
+
+## Final Predictions Validation
+
+We refit our XGBoost to the combined training and test data; create predictions and upload the results to Kaggle. Our public leaderboard score is about 0.35. This is bigger than our test MSE, which may indicate a problem of over-fitting.
+
+Actually, we have tried lots of editions of our ensemble tree models. It seems that, as for this public leaderboard score, 0.35 is kind of a limit or bottleneck: we can't go over this value and get better score. Maybe this is also one problem with the ensemble tree models for this data, it's hard to do minor adjustment on the results.
+
+```{r final submit, eval=FALSE}
+xgb2 <- xgboost(
+  data = diff_model_data2,
+  label = y_diff,
+  params = list(eta = 0.01, eval_metric = "rmse"),
+  max.depth = 6,
+  nrounds = 250,
+  verbose = 0
+)
+
+xgb2_pred <- predict(xgb2, newdata = diff_model_valid)
+xgb2_pred <- xgb2_pred + Happiness2018
+
+result <- data.frame(Country.Territory = data_valid$Country.Territory,
+           Happiness = xgb2_pred)
+lj <- left_join(result, CountryInfo, by = "Country.Territory")
+result_submission <- left_join(submission_result, lj, by = "Code")
+final_result <- result_submission[,c(1,4)] %>% rename(Happiness = Happiness.y)
+
+# write.csv(final_result, file = "submission.csv", row.names = FALSE)
+```
+
+
